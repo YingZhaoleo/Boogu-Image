@@ -21,7 +21,7 @@ Import utilities: Utilities related to imports and our lazy inits.
 import importlib.util
 import sys
 
-from .npu_utils import is_torch_npu_available
+from .npu_utils import is_npu_requested
 
 # The package importlib_metadata is in a different place, depending on the python version.
 if sys.version_info < (3, 8):
@@ -48,8 +48,8 @@ _flash_attn_available, _flash_attn_version = _is_package_available("flash_attn")
 
 
 def is_triton_available():
-    return _triton_available and not is_torch_npu_available()
+    return _triton_available and not is_npu_requested()
 
 
 def is_flash_attn_available():
-    return _flash_attn_available and not is_torch_npu_available()
+    return _flash_attn_available and not is_npu_requested()

@@ -51,6 +51,7 @@ from boogu.utils.validator_utils import (
     get_device_validator,
     validate_device_and_offload_strategy_compatibility,
 )
+from boogu.utils.npu_utils import is_npu_device, make_generator, set_device_if_npu
 
 
 def to_bool(s):
@@ -903,7 +904,7 @@ def load_pipeline(
         raise ValueError(
             "[Device and Offload Strategy Compatibility Error]: The device and offload strategy are not compatible. "
             "Please make sure all three offload flags are valid booleans, at most one offload strategy is enabled, "
-            "and `device` is a CUDA execution device when any CPU offload strategy is enabled. "
+            "and `device` is a non-CPU execution device when any CPU offload strategy is enabled. "
             f"device={args.device}, "
             f"enable_sequential_cpu_offload_flag={args.enable_sequential_cpu_offload_flag}, "
             f"enable_model_cpu_offload_flag={args.enable_model_cpu_offload_flag}, "
@@ -919,7 +920,10 @@ def load_pipeline(
                 and args.custom_local_instruction_rewriter_model.strip(),
                 args.rewriter_device is not None and args.rewriter_device != "cpu",
                 (args.device == args.rewriter_device)
-                or (args.rewriter_device == "auto" and args.device.startswith("cuda")),
+                or (
+                    args.rewriter_device == "auto"
+                    and args.device.startswith(("cuda", "npu"))
+                ),
                 args.unload_rewriter_level != "keep",
             ]
         ):
@@ -930,7 +934,7 @@ def load_pipeline(
                 "2. use_dashscope_remote_rewriting == False "
                 "3. custom_local_instruction_rewriter_model is set and successfully loaded "
                 "4. rewriter_device is not cpu "
-                "5. device and rewriter_device are the same, or rewriter_device is auto and device is cuda or cuda:x "
+                "5. device and rewriter_device are the same, or rewriter_device is auto and device is cuda/cuda:x or npu/npu:x "
                 "6. unload_rewriter_level != 'keep'. "
                 "Outside this case, it is usually unnecessary and can slow repeated reuse because weights are moved "
                 "between CPU and GPU more often.",
@@ -959,26 +963,27 @@ def load_pipeline(
         pipeline.enable_model_cpu_offload(device=args.device)
     elif args.enable_group_offload_flag:
         pipeline.enable_group_offload_flag = True
+        use_stream = not is_npu_device(args.device)
         apply_group_offloading(
             pipeline.transformer,
             onload_device=args.device,
             offload_type="block_level",
             num_blocks_per_group=1,
-            use_stream=True,
+            use_stream=use_stream,
         )
         apply_group_offloading(
             pipeline.mllm,
             onload_device=args.device,
             offload_type="block_level",
             num_blocks_per_group=1,
-            use_stream=True,
+            use_stream=use_stream,
         )
         apply_group_offloading(
             pipeline.vae,
             onload_device=args.device,
             offload_type="block_level",
             num_blocks_per_group=1,
-            use_stream=True,
+            use_stream=use_stream,
         )
         if args.use_prompt_tuning:
             apply_group_offloading(
@@ -986,7 +991,7 @@ def load_pipeline(
                 onload_device=args.device,
                 offload_type="block_level",
                 num_blocks_per_group=1,
-                use_stream=True,
+                use_stream=use_stream,
             )
 
     if args.enable_torch_compile:
@@ -1047,7 +1052,7 @@ def run(
     input_image_paths: Optional[List[List[str]]] = None,
 ) -> Image.Image:
     """Run the image generation pipeline with the given parameters."""
-    generator = torch.Generator(device=args.device).manual_seed(args.seed)
+    generator = make_generator(args.device, args.seed)
 
     results = pipeline(
         instruction=instruction,
@@ -1127,6 +1132,7 @@ def create_collage(images: List[torch.Tensor]) -> Image.Image:
 
 def main(args: argparse.Namespace, root_dir: str) -> None:
     """Main function to run the image generation process."""
+    set_device_if_npu(args.device)
 
     # Set weight dtype
     weight_dtype = torch.float32

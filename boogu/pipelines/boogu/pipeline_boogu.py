@@ -31,6 +31,7 @@ from boogu.schedulers.scheduling_flow_match_euler_discrete_time_shifting import 
 )
 from boogu.utils.teacache_util import TeaCacheParams
 from boogu.utils.validator_utils import get_device_validator
+from boogu.utils.npu_utils import import_torch_npu, is_npu_device
 
 from ...models.transformers.rope import BooguImageRotaryPosEmbed
 from ..lora_pipeline import BooguImageLoraLoaderMixin
@@ -271,8 +272,10 @@ class BooguImagePipeline(DiffusionPipeline, BooguImageLoraLoaderMixin):
 
     def _validate_device_format(
         self,
-        device: Literal[None, "cpu", "cuda", "cuda:x"] = "cpu",
-        rewriter_device: Literal[None, "cpu", "cuda", "cuda:x", "auto"] = "cpu",
+        device: Literal[None, "cpu", "cuda", "cuda:x", "npu", "npu:x"] = "cpu",
+        rewriter_device: Literal[
+            None, "cpu", "cuda", "cuda:x", "npu", "npu:x", "auto"
+        ] = "cpu",
     ):
         device = device.lower() if isinstance(device, str) else device
         rewriter_device = (
@@ -294,8 +297,10 @@ class BooguImagePipeline(DiffusionPipeline, BooguImageLoraLoaderMixin):
         enable_model_cpu_offload_flag: bool = None,
         enable_sequential_cpu_offload_flag: bool = None,
         enable_group_offload_flag: bool = None,
-        rewriter_device: Literal[None, "cpu", "cuda", "cuda:x", "auto"] = None,
-        device: Literal[None, "cpu", "cuda", "cuda:x"] = None,
+        rewriter_device: Literal[
+            None, "cpu", "cuda", "cuda:x", "npu", "npu:x", "auto"
+        ] = None,
+        device: Literal[None, "cpu", "cuda", "cuda:x", "npu", "npu:x"] = None,
         use_rewrite_text_instruction: bool = False,
         use_dashscope_remote_rewriting: bool = False,
         dashscope_api_key: str = None,
@@ -350,7 +355,11 @@ class BooguImagePipeline(DiffusionPipeline, BooguImageLoraLoaderMixin):
             if device_name is None:
                 return None
             device_name = str(device_name).lower()
-            return "cuda:0" if device_name == "cuda" else device_name
+            if device_name == "cuda":
+                return "cuda:0"
+            if device_name == "npu":
+                return "npu:0"
+            return device_name
 
         if (
             use_rewrite_text_instruction
@@ -377,11 +386,15 @@ class BooguImagePipeline(DiffusionPipeline, BooguImageLoraLoaderMixin):
 
     def devices_manager(
         self,
-        instant_device_2_use: Literal[None, "cpu", "cuda", "cuda:x"] = None,
-        instant_rewriter_device: Literal[None, "cpu", "cuda", "cuda:x", "auto"] = None,
-        user_set_pipe_device: Literal[None, "cpu", "cuda", "cuda:x"] = None,
-        user_set_rewriter_device: Literal[None, "cpu", "cuda", "cuda:x", "auto"] = None,
-        execution_device: Literal[None, "cpu", "cuda", "cuda:x"] = None,
+        instant_device_2_use: Literal[None, "cpu", "cuda", "cuda:x", "npu", "npu:x"] = None,
+        instant_rewriter_device: Literal[
+            None, "cpu", "cuda", "cuda:x", "npu", "npu:x", "auto"
+        ] = None,
+        user_set_pipe_device: Literal[None, "cpu", "cuda", "cuda:x", "npu", "npu:x"] = None,
+        user_set_rewriter_device: Literal[
+            None, "cpu", "cuda", "cuda:x", "npu", "npu:x", "auto"
+        ] = None,
+        execution_device: Literal[None, "cpu", "cuda", "cuda:x", "npu", "npu:x"] = None,
         unload_rewriter_level: Literal["keep", "cpu", "destroy"] = "destroy",
         enable_model_cpu_offload_flag: bool = None,
         enable_sequential_cpu_offload_flag: bool = None,
@@ -752,6 +765,25 @@ class BooguImagePipeline(DiffusionPipeline, BooguImageLoraLoaderMixin):
             for mm_obj in mllm_candidates
         )
 
+    def _clear_npu_cache_if_needed(self, device: torch.device) -> None:
+        if not is_npu_device(device):
+            return
+        torch_npu = import_torch_npu()
+        if (
+            torch_npu is not None
+            and hasattr(torch_npu, "npu")
+            and hasattr(torch_npu.npu, "empty_cache")
+        ):
+            torch_npu.npu.empty_cache()
+        elif hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
+            torch.npu.empty_cache()
+
+    def _clear_accelerator_cache(self) -> None:
+        if is_npu_device(self.user_set_pipe_device):
+            self._clear_npu_cache_if_needed(self.user_set_pipe_device)
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def unload_instruction_rewriter_resources(self):
         """
         Unload optional instruction rewriter model/processor references.
@@ -804,8 +836,7 @@ class BooguImagePipeline(DiffusionPipeline, BooguImageLoraLoaderMixin):
                     return_flags = ("keep", return_flags[1])
 
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._clear_accelerator_cache()
         else:
             if getattr(self, "text_instruction_rewriter", None) is not None:
                 self.text_instruction_rewriter.to(self.user_set_pipe_device)
@@ -828,8 +859,7 @@ class BooguImagePipeline(DiffusionPipeline, BooguImageLoraLoaderMixin):
                 return_flags = (return_flags[0], "keep")
 
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._clear_accelerator_cache()
 
         return return_flags
 
@@ -2716,8 +2746,10 @@ class BooguImagePipeline(DiffusionPipeline, BooguImageLoraLoaderMixin):
         return_dict: bool = True,
         verbose: bool = False,
         step_func=None,
-        device: Literal[None, "cpu", "cuda", "cuda:x"] = "cuda",
-        rewriter_device: Literal[None, "cpu", "cuda", "cuda:x", "auto"] = "cpu",
+        device: Literal[None, "cpu", "cuda", "cuda:x", "npu", "npu:x"] = "cuda",
+        rewriter_device: Literal[
+            None, "cpu", "cuda", "cuda:x", "npu", "npu:x", "auto"
+        ] = "cpu",
         unload_rewriter_level: Literal["keep", "cpu", "destroy"] = "destroy",
         enable_inner_devices_manager: bool = False,
     ):

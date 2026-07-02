@@ -10,6 +10,11 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from ...utils.npu_utils import is_npu_requested
+
+if is_npu_requested():
+    raise ImportError("Triton RMSNorm kernels are CUDA-only and disabled for NPU runs.")
+
 import triton
 import triton.language as tl
 
