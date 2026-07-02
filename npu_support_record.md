@@ -26,6 +26,7 @@ This branch adapts Boogu-Image inference so the model can run on Ascend NPU whil
 - Added NPU device setup through `torch.npu.set_device(...)` when the selected device is NPU.
 - Disabled diffusers group-offload streams on NPU because CUDA stream assumptions are unsafe there.
 - Added NPU cache clearing through `torch_npu.npu.empty_cache()` or `torch.npu.empty_cache()` in pipeline cleanup paths.
+- Made Cache-DiT an optional CUDA-only dependency path; NPU inference does not import it, and Cache-DiT caching is rejected on NPU.
 
 ## Documentation
 

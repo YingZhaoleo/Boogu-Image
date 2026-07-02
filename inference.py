@@ -29,7 +29,6 @@ import re
 import warnings
 from typing import List, Optional, Tuple
 
-import cache_dit
 import torch
 from diffusers.hooks import apply_group_offloading
 from omegaconf import OmegaConf
@@ -681,6 +680,7 @@ def apply_cache_dit_caching(
     pipeline: BooguImagePipeline | BooguImagePromptTuningPipeline,
     *,
     all_layers: bool = False,
+    device: str | torch.device | None = None,
 ):
     """
     Apply Cache-DiT caching to the pipeline.
@@ -690,6 +690,19 @@ def apply_cache_dit_caching(
     Returns:
         The pipeline with Cache-DiT caching applied.
     """
+    if is_npu_device(device):
+        raise ValueError(
+            "Cache-DiT is CUDA-only in this repository and is disabled for NPU inference."
+        )
+
+    try:
+        import cache_dit
+    except ImportError as exc:
+        raise ImportError(
+            "Cache-DiT caching requires the optional `cache-dit` dependency. "
+            "Install it only for CUDA runs that enable Cache-DiT."
+        ) from exc
+
     if all_layers:
         blocks = [
             pipeline.transformer.double_stream_layers,
@@ -1018,7 +1031,9 @@ def load_pipeline(
 
     if enable_cache_dit_caching:
         pipeline = apply_cache_dit_caching(
-            pipeline, all_layers=args.enable_cache_dit_caching_for_all_layers
+            pipeline,
+            all_layers=args.enable_cache_dit_caching_for_all_layers,
+            device=args.device,
         )
         print("[Pipeline Loader]: Cache-DiT caching applied to the pipeline.")
 

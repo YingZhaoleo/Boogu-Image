@@ -1,7 +1,6 @@
 import argparse
 import os
 
-import cache_dit
 import torch
 
 os.environ["device"] = "cuda"
@@ -46,6 +45,13 @@ def resolve_torch_dtype(dtype_name):
 
 def main():
     args = parse_args()
+    try:
+        import cache_dit
+    except ImportError as exc:
+        raise ImportError(
+            "Transformer quantization requires the optional CUDA-only `cache-dit` dependency."
+        ) from exc
+
     torch_dtype = resolve_torch_dtype(args.torch_dtype)
 
     transformer = BooguImageTransformer2DModel.from_pretrained(
