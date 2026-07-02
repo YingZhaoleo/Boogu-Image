@@ -1,4 +1,3 @@
-import os
 import warnings
 from typing import Optional, Tuple
 
@@ -7,18 +6,20 @@ import torch.nn as nn
 from diffusers.models.embeddings import Timesteps
 
 from ...utils.import_utils import is_flash_attn_available, is_triton_available
+from ...utils.npu_utils import is_torch_npu_available
 from ..embeddings import TimestepEmbedding
 
-if is_triton_available() and ("cuda" in os.getenv("device", "cpu")):
+if is_triton_available():
     from ...ops.triton.layer_norm import RMSNorm
 else:
-    from torch.nn import RMSNorm
+    from .components import NpuRMSNorm as RMSNorm
 
-    warnings.warn(
-        "Cannot import triton, install triton to use fused RMSNorm for better performance"
-    )
+    if not is_torch_npu_available():
+        warnings.warn(
+            "Cannot import triton, install triton to use fused RMSNorm for better performance"
+        )
 
-if is_flash_attn_available() and ("cuda" in os.getenv("device", "cpu")):
+if is_flash_attn_available():
     from flash_attn.ops.activations import swiglu
 
     from .components import swiglu as torch_swiglu
@@ -26,9 +27,10 @@ else:
     from .components import swiglu
     from .components import swiglu as torch_swiglu
 
-    warnings.warn(
-        "Cannot import flash_attn, install flash_attn to use fused SwiGLU for better performance"
-    )
+    if not is_torch_npu_available():
+        warnings.warn(
+            "Cannot import flash_attn, install flash_attn to use fused SwiGLU for better performance"
+        )
 
 # try:
 # except ImportError:

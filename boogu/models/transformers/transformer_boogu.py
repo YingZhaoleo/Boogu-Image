@@ -13,7 +13,6 @@ limitations under the License.
 """
 
 import itertools
-import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -33,7 +32,7 @@ from diffusers.utils import (
 )
 from einops import rearrange
 
-from ...utils.import_utils import is_triton_available
+from ...utils.import_utils import is_flash_attn_available, is_triton_available
 from ...utils.teacache_util import TeaCacheParams
 from ..attention_processor import (
     BooguImageAttnProcessor,
@@ -52,10 +51,10 @@ from .rope import (
     BooguImagePromptTuningRotaryPosEmbed,
 )
 
-if is_triton_available() and ("cuda" in os.getenv("device", "cpu")):
+if is_triton_available():
     from ...ops.triton.layer_norm import RMSNorm
 else:
-    from torch.nn import RMSNorm
+    from .components import NpuRMSNorm as RMSNorm
 
 from ...cache_functions import cal_type
 from ...taylorseer_utils import (
@@ -69,6 +68,39 @@ from ...taylorseer_utils import (
 logger = logging.get_logger(__name__)
 
 # Local runtime utilities.
+
+
+def _rope_last_dim(rotary_emb):
+    return (
+        rotary_emb[0].shape[-1]
+        if isinstance(rotary_emb, (tuple, list))
+        else rotary_emb.shape[-1]
+    )
+
+
+def _new_rope_batch(reference, *shape, rotary_emb):
+    if isinstance(rotary_emb, (tuple, list)):
+        return (
+            reference.new_zeros(
+                *shape, _rope_last_dim(rotary_emb), dtype=rotary_emb[0].dtype
+            ),
+            reference.new_zeros(
+                *shape, _rope_last_dim(rotary_emb), dtype=rotary_emb[1].dtype
+            ),
+        )
+    if reference.device.type == "npu":
+        raise TypeError(
+            "NPU RoPE batching requires real-valued (cos, sin) tensors; complex RoPE is unsupported."
+        )
+    return reference.new_zeros(*shape, _rope_last_dim(rotary_emb), dtype=rotary_emb.dtype)
+
+
+def _assign_rope(target, target_slice, source, source_slice):
+    if isinstance(source, (tuple, list)):
+        target[0][target_slice] = source[0][source_slice]
+        target[1][target_slice] = source[1][source_slice]
+    else:
+        target[target_slice] = source[source_slice]
 
 
 class PromptEmbedding(
@@ -206,14 +238,13 @@ class BooguImageTransformerBlock(nn.Module):
         self.head_dim = dim // num_attention_heads
         self.modulation = modulation
 
-        if "cpu" in os.getenv("device", "cpu"):
-            processor = BooguImageAttnProcessor()
-
-        else:
+        if is_flash_attn_available():
             try:
                 processor = BooguImageAttnProcessorFlash2Varlen()
             except ImportError:
                 processor = BooguImageAttnProcessor()
+        else:
+            processor = BooguImageAttnProcessor()
 
         # Initialize attention layer
         self.attn = Attention(
@@ -416,22 +447,15 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
         self.modulation = modulation
         self.hidden_size = dim
 
-        if "cpu" in os.getenv("device", "cpu"):
-            processor = BooguImageAttnProcessor()
-        else:
+        if is_flash_attn_available():
             try:
                 processor = BooguImageAttnProcessorFlash2Varlen()
             except ImportError:
                 processor = BooguImageAttnProcessor()
-
-        if "cpu" in os.getenv("device", "cpu"):
-            double_stream_processor = BooguImageDoubleStreamSelfAttnProcessor(
-                head_dim=self.head_dim,
-                num_attention_heads=num_attention_heads,
-                num_kv_heads=num_kv_heads,
-                qkv_bias=False,
-            )
         else:
+            processor = BooguImageAttnProcessor()
+
+        if is_flash_attn_available():
             try:
                 double_stream_processor = (
                     BooguImageDoubleStreamSelfAttnProcessorFlash2Varlen(
@@ -448,6 +472,13 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
                     num_kv_heads=num_kv_heads,
                     qkv_bias=False,
                 )
+        else:
+            double_stream_processor = BooguImageDoubleStreamSelfAttnProcessor(
+                head_dim=self.head_dim,
+                num_attention_heads=num_attention_heads,
+                num_kv_heads=num_kv_heads,
+                qkv_bias=False,
+            )
 
         # Image stream components.
         self.img_instruct_attn = Attention(
@@ -1055,11 +1086,11 @@ class BooguImageTransformer2DModel(
         batch_ref_image_hidden_states = ref_image_hidden_states.new_zeros(
             num_ref_images, max_ref_img_len, self.config.hidden_size
         )
-        batch_ref_img_rotary_emb = hidden_states.new_zeros(
+        batch_ref_img_rotary_emb = _new_rope_batch(
+            hidden_states,
             num_ref_images,
             max_ref_img_len,
-            ref_img_rotary_emb.shape[-1],
-            dtype=ref_img_rotary_emb.dtype,
+            rotary_emb=ref_img_rotary_emb,
         )
         batch_temb = temb.new_zeros(num_ref_images, *temb.shape[1:], dtype=temb.dtype)
 
@@ -1072,9 +1103,12 @@ class BooguImageTransformer2DModel(
                 batch_ref_image_hidden_states[idx, :ref_img_len] = (
                     ref_image_hidden_states[i, shift : shift + ref_img_len]
                 )
-                batch_ref_img_rotary_emb[idx, :ref_img_len] = ref_img_rotary_emb[
-                    i, shift : shift + ref_img_len
-                ]
+                _assign_rope(
+                    batch_ref_img_rotary_emb,
+                    (idx, slice(None, ref_img_len)),
+                    ref_img_rotary_emb,
+                    (i, slice(shift, shift + ref_img_len)),
+                )
                 batch_temb[idx] = temb[i]
                 shift += ref_img_len
                 idx += 1

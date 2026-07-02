@@ -8,11 +8,12 @@ import torch.nn.functional as F
 from einops import repeat
 
 from ..utils.import_utils import is_flash_attn_available
+from ..utils.npu_utils import import_torch_npu, is_npu_device, is_torch_npu_available
 
 if is_flash_attn_available():
     from flash_attn import flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
-else:
+elif not is_torch_npu_available():
     warnings.warn(
         "Cannot import flash_attn, install flash_attn to use Flash2Varlen attention for better performance"
     )
@@ -21,6 +22,110 @@ else:
 from diffusers.models.attention_processor import Attention
 
 from .embeddings import apply_rotary_emb
+
+
+def _prepare_sdpa_attention_mask(
+    attention_mask: torch.Tensor,
+    batch_size: int,
+    query_length: int,
+    key_length: int,
+    device: torch.device,
+    rebuild_causal_from_diagonal: bool = False,
+) -> torch.Tensor:
+    """Normalize keep-mask layouts for SDPA and Ascend FlashAttentionScore."""
+    attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+
+    if attention_mask.dim() == 2:
+        if attention_mask.shape != (batch_size, key_length):
+            raise ValueError(
+                f"Expected 2D attention_mask shape {(batch_size, key_length)}, "
+                f"got {tuple(attention_mask.shape)}"
+            )
+        return attention_mask[:, None, None, :].expand(
+            batch_size, 1, query_length, key_length
+        ).contiguous()
+
+    if attention_mask.dim() == 3:
+        if attention_mask.shape != (batch_size, query_length, key_length):
+            raise ValueError(
+                f"Expected 3D attention_mask shape {(batch_size, query_length, key_length)}, "
+                f"got {tuple(attention_mask.shape)}"
+            )
+
+        if rebuild_causal_from_diagonal:
+            if query_length != key_length:
+                raise ValueError(
+                    "Causal attention masks must have matching query and key lengths"
+                )
+            diag_valid = torch.diagonal(attention_mask, dim1=-2, dim2=-1)
+            lengths = diag_valid.sum(dim=-1)
+            arange_length = torch.arange(query_length, device=device)
+            valid_tokens = arange_length.unsqueeze(0) < lengths.unsqueeze(1)
+            causal = torch.tril(
+                torch.ones(query_length, key_length, dtype=torch.bool, device=device)
+            )
+            attention_mask = (
+                causal & valid_tokens.unsqueeze(-1) & valid_tokens.unsqueeze(-2)
+            )
+
+        return attention_mask[:, None, :, :].contiguous()
+
+    if attention_mask.dim() == 4:
+        if attention_mask.shape[0] not in (1, batch_size):
+            raise ValueError(
+                f"Expected 4D attention_mask batch dimension 1 or {batch_size}, "
+                f"got {attention_mask.shape[0]}"
+            )
+        if attention_mask.shape[-2:] != (query_length, key_length):
+            raise ValueError(
+                f"Expected 4D attention_mask trailing shape {(query_length, key_length)}, "
+                f"got {tuple(attention_mask.shape[-2:])}"
+            )
+        return attention_mask.contiguous()
+
+    raise ValueError(f"Unsupported attention_mask shape: {attention_mask.shape}")
+
+
+def _npu_fusion_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scale: float,
+) -> Optional[torch.Tensor]:
+    """Use Ascend fused attention for BNSD tensors when supported."""
+    if not is_npu_device(query.device):
+        return None
+
+    torch_npu = import_torch_npu()
+    if torch_npu is None or not hasattr(torch_npu, "npu_fusion_attention"):
+        return None
+
+    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+        return None
+    if (
+        query.dtype not in (torch.float16, torch.bfloat16)
+        or key.dtype != query.dtype
+        or value.dtype != query.dtype
+    ):
+        return None
+
+    if attention_mask is not None:
+        # Keep masked attention on SDPA until each mask layout is validated on Ascend.
+        return None
+
+    try:
+        return torch_npu.npu_fusion_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            query.shape[1],
+            "BNSD",
+            scale=scale,
+            keep_prob=1.0,
+        )[0]
+    except (RuntimeError, TypeError, ValueError):
+        return None
 
 
 class BooguImageDoubleStreamSelfAttnProcessorFlash2Varlen(nn.Module):
@@ -819,21 +924,6 @@ class BooguImageDoubleStreamSelfAttnProcessor(nn.Module):
         else:
             softmax_scale = attn.scale
 
-        # scaled_dot_product_attention expects attention_mask shape to be
-        # (batch, heads, source_length, target_length)
-        if joint_attention_mask is not None:
-            joint_attention_mask = joint_attention_mask.bool()
-            if joint_attention_mask.dim() == 2:
-                # Standard mask [B, seq_len] -> [B, 1, 1, seq_len]
-                joint_attention_mask = joint_attention_mask.view(batch_size, 1, 1, -1)
-            elif joint_attention_mask.dim() == 3:
-                # Causal mask [B, seq_len, seq_len] -> [B, 1, seq_len, seq_len]
-                joint_attention_mask = joint_attention_mask.unsqueeze(1)
-            else:
-                raise ValueError(
-                    f"Unsupported joint_attention_mask shape: {joint_attention_mask.shape}"
-                )
-
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
@@ -842,9 +932,22 @@ class BooguImageDoubleStreamSelfAttnProcessor(nn.Module):
         key = key.repeat_interleave(query.size(-3) // key.size(-3), -3)
         value = value.repeat_interleave(query.size(-3) // value.size(-3), -3)
 
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=joint_attention_mask, scale=softmax_scale
+        if joint_attention_mask is not None:
+            joint_attention_mask = _prepare_sdpa_attention_mask(
+                joint_attention_mask,
+                batch_size,
+                query.shape[-2],
+                key.shape[-2],
+                query.device,
+            )
+
+        hidden_states = _npu_fusion_attention(
+            query, key, value, joint_attention_mask, softmax_scale
         )
+        if hidden_states is None:
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=joint_attention_mask, scale=softmax_scale
+            )
         hidden_states = hidden_states.transpose(1, 2).reshape(
             batch_size, -1, attn.heads * head_dim
         )
@@ -1224,34 +1327,6 @@ class BooguImageAttnProcessor:
         else:
             softmax_scale = attn.scale
 
-        # sdpa expects attn_mask with shape (B, H, Q, K) as boolean (True keeps, False masks)
-        if attention_mask is not None:
-            attention_mask = attention_mask.bool()
-            if attention_mask.dim() == 2:
-                # Standard padding mask [B, L] -> [B, 1, 1, L]
-                attention_mask = attention_mask.view(batch_size, 1, 1, -1)
-            elif attention_mask.dim() == 3:
-                # Robust causal + padding mask construction
-                # Infer valid lengths from diagonal, then build lower-triangular mask within valid lengths
-                B, L, _ = attention_mask.shape
-                diag_valid = torch.diagonal(attention_mask, dim1=-2, dim2=-1)
-                lengths = diag_valid.sum(dim=-1)  # [B]
-                arange_L = torch.arange(L, device=attention_mask.device)
-                # Padding masks for queries and keys: shape [B, L]
-                q_valid = arange_L.unsqueeze(0) < lengths.unsqueeze(1)
-                k_valid = q_valid  # same lengths assumed
-                # Lower-triangular causal mask [L, L]
-                causal = torch.tril(
-                    torch.ones(L, L, dtype=torch.bool, device=attention_mask.device)
-                )
-                # Combine: [B, L, L]
-                combined = causal & q_valid.unsqueeze(-1) & k_valid.unsqueeze(-2)
-                attention_mask = combined.unsqueeze(1)  # [B, 1, L, L]
-            else:
-                raise ValueError(
-                    f"Unsupported attention_mask shape: {attention_mask.shape}"
-                )
-
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
@@ -1260,9 +1335,23 @@ class BooguImageAttnProcessor:
         key = key.repeat_interleave(query.size(-3) // key.size(-3), -3)
         value = value.repeat_interleave(query.size(-3) // value.size(-3), -3)
 
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, scale=softmax_scale
+        if attention_mask is not None:
+            attention_mask = _prepare_sdpa_attention_mask(
+                attention_mask,
+                batch_size,
+                query.shape[-2],
+                key.shape[-2],
+                query.device,
+                rebuild_causal_from_diagonal=True,
+            )
+
+        hidden_states = _npu_fusion_attention(
+            query, key, value, attention_mask, softmax_scale
         )
+        if hidden_states is None:
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, scale=softmax_scale
+            )
         hidden_states = hidden_states.transpose(1, 2).reshape(
             batch_size, -1, attn.heads * head_dim
         )

@@ -44,6 +44,10 @@ English | [中文](./README_CN.md)
 
 This repository provides checkpoints and inference code for **Boogu-Image-0.1**.
 
+### Ascend NPU Supported Branch
+
+This branch adds Ascend NPU inference support in the model kernel/import path. The main changes are lazy `torch_npu` registration and NPU device detection, NPU-safe gating that avoids CUDA-only FlashAttention and Triton imports, SDPA attention fallback/preference on NPU, guarded Ascend kernel paths for RMSNorm, SwiGLU, RoPE, and optional fused attention, and real-valued `(cos, sin)` RoPE tensors for the active NPU path.
+
 ## 📣 News
 - **2026-06-XX** 🧊 **Boogu-Image-0.1-Edit-Turbo (Image-to-Image) is coming!**
 - **2026-06-xx** 🧊 Happy Dragon Boat Festival! We have seen many community reviews and feedback, and we will continue to update the model accordingly. Due to differences in product design philosophy, the Boogu series stands apart from most existing open-source models. While other models tend to rely on reinforcement learning techniques to enhance aesthetics, Boogu focuses on using diverse data to give users more control. This is precisely why we adopt an integrated understanding-and-generation system: we need more precise instruction control. We will release a user manual in three days to help everyone make better use of the Boogu series models.

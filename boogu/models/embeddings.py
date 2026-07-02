@@ -20,6 +20,8 @@ import torch
 from diffusers.models.activations import get_activation
 from torch import nn
 
+from ..utils.npu_utils import import_torch_npu, is_npu_device
+
 
 class TimestepEmbedding(nn.Module):
     def __init__(
@@ -79,10 +81,10 @@ class TimestepEmbedding(nn.Module):
 
 def apply_rotary_emb(
     x: torch.Tensor,
-    freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor]],
+    freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     use_real: bool = True,
     use_real_unbind_dim: int = -1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Apply rotary embeddings to input tensors using the given frequency tensor. This function applies rotary embeddings
     to the given query or key 'x' tensors using the provided frequency tensor 'freqs_cis'. The input tensors are
@@ -120,10 +122,48 @@ def apply_rotary_emb(
                 f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2."
             )
 
-        out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+        torch_npu = import_torch_npu()
+        if (
+            torch_npu is not None
+            and hasattr(torch_npu, "npu_rotary_mul")
+            and is_npu_device(x.device)
+            and use_real_unbind_dim == -2
+            and x.dim() == 4
+            and cos.dim() == 4
+            and sin.dim() == 4
+            and x.shape[-1] % 128 == 0
+        ):
+            try:
+                return torch_npu.npu_rotary_mul(x, cos, sin).to(x.dtype)
+            except (RuntimeError, TypeError, ValueError):
+                pass
 
-        return out
+        return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
     else:
+        if isinstance(freqs_cis, (tuple, list)) and len(freqs_cis) == 2:
+            cos, sin = freqs_cis
+            cos, sin = cos.to(x.device), sin.to(x.device)
+
+            if cos.dim() == 2:
+                cos = cos[None, :, None, :]
+                sin = sin[None, :, None, :]
+            elif cos.dim() == 3:
+                cos = cos[:, :, None, :]
+                sin = sin[:, :, None, :]
+            elif cos.dim() != 4:
+                raise ValueError(f"Unsupported real RoPE shape: {cos.shape}")
+
+            x_real, x_imag = x.float().reshape(
+                *x.shape[:-1], x.shape[-1] // 2, 2
+            ).unbind(-1)
+            x_rotated = torch.stack((-x_imag, x_real), dim=-1).flatten(3)
+            return (x.float() * cos + x_rotated * sin).to(x.dtype)
+
+        if is_npu_device(x.device):
+            raise TypeError(
+                "NPU RoPE path requires real-valued (cos, sin) tensors; complex RoPE is unsupported."
+            )
+
         # used for lumina
         x_rotated = torch.view_as_complex(
             x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2)

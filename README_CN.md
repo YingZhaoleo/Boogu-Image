@@ -44,6 +44,10 @@
 
 本仓库提供 **Boogu-Image-0.1** 的模型权重和推理代码。
 
+### Ascend NPU 支持分支
+
+本分支在模型的 kernel/import 路径中加入 Ascend NPU 推理支持。主要变更包括：懒加载 `torch_npu` 并检测 NPU 设备；在 NPU 上安全关闭 CUDA-only 的 FlashAttention 和 Triton 导入；在 NPU 上优先使用/回退到 SDPA attention；为 RMSNorm、SwiGLU、RoPE 和可选 fused attention 增加带保护的 Ascend kernel 路径；并在 NPU 活跃路径中使用实数形式的 `(cos, sin)` RoPE 张量。
+
 ## 🏆 Boogu Arena
 
 由于我们无法直接在 LM Arena 上评测，我们构建了 **Boogu Arena**——一套 LM Arena 风格的偏好评测。我们使用 LLM 生成多样化的用户画像（persona），再让每个画像产出图像生成提示词，共得到 **1K+ 条测试提示词**，并将公开发布以供社区复现。下方的 ELO 排行榜涵盖了领先的闭源与开源系统。我们欢迎对结果有疑问的团队与我们联系，以便我们能够努力实现更加客观、公平和可重复的评估。
