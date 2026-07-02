@@ -29,11 +29,11 @@ import re
 import warnings
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 from diffusers.hooks import apply_group_offloading
 from omegaconf import OmegaConf
 from PIL import Image, ImageOps
-from torchvision.transforms.functional import to_pil_image, to_tensor
 from transformers import AutoProcessor
 
 from boogu.utils.npu_utils import (
@@ -68,6 +68,19 @@ def to_bool(s):
     if s in {"false", "f", "0", "no", "n", "off", ""}:
         return False
     raise argparse.ArgumentTypeError("Expect bool value: true/false, 1/0, yes/no")
+
+
+def to_tensor(image: Image.Image) -> torch.Tensor:
+    """Convert a PIL image to a CHW float tensor without importing torchvision."""
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return torch.from_numpy(array).permute(2, 0, 1).float().div(255)
+
+
+def to_pil_image(tensor: torch.Tensor) -> Image.Image:
+    """Convert a CHW tensor in [0, 1] to a PIL image without importing torchvision."""
+    tensor = tensor.detach().to("cpu").clamp(0, 1)
+    array = tensor.mul(255).byte().permute(1, 2, 0).numpy()
+    return Image.fromarray(array)
 
 
 def parse_args() -> argparse.Namespace:
