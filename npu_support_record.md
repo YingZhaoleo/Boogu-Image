@@ -4,14 +4,14 @@ This branch adapts Boogu-Image inference so the model can run on Ascend NPU whil
 
 ## Migration Notes
 
-- Import `torch_npu` lazily and early enough for PyTorch to register the `npu` backend before model placement.
+- Import `torch_npu` from the shared helper when available so PyTorch registers the `npu` backend before model placement.
 - Treat FlashAttention and Triton kernels as CUDA-only unless the runtime explicitly targets CUDA.
 - Prefer PyTorch SDPA on NPU, with guarded Ascend fused kernels only when tensor layout, dtype, and mask constraints are satisfied.
 - Keep RoPE on the active NPU path in real-valued `(cos, sin)` form and avoid complex rotary tensors.
 
 ## Kernel And Import Changes
 
-- Added lazy `torch_npu` helpers in `boogu/utils/npu_utils.py` for NPU registration, device checks, NPU-request detection, device setup, and generator fallback.
+- Added `torch_npu` helpers in `boogu/utils/npu_utils.py` for NPU registration, availability checks, device checks, device setup, and generator fallback.
 - Updated `boogu/utils/import_utils.py` so FlashAttention and Triton are disabled when NPU is requested, avoiding CUDA-only imports on Ascend.
 - Added a direct guard in `boogu/ops/triton/layer_norm.py` so Triton layer norm cannot evaluate CUDA autotune decorators during NPU-targeted runs.
 - Added guarded NPU kernel paths for RMSNorm, SwiGLU, RoPE, and optional fused attention, with PyTorch fallbacks for unsupported shapes, dtypes, or masks.
@@ -21,6 +21,7 @@ This branch adapts Boogu-Image inference so the model can run on Ascend NPU whil
 ## Runtime Failure Guards
 
 - Accepted `npu` and `npu:x` device strings in shared device validation.
+- Importing `boogu.utils.npu_utils` attempts `torch_npu` registration when the package is available.
 - Added NPU-safe generator creation with CPU fallback when backend generator support is unavailable.
 - Added NPU device setup through `torch.npu.set_device(...)` when the selected device is NPU.
 - Disabled diffusers group-offload streams on NPU because CUDA stream assumptions are unsafe there.

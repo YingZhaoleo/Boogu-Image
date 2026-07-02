@@ -37,6 +37,12 @@ from PIL import Image, ImageOps
 from torchvision.transforms.functional import to_pil_image, to_tensor
 from transformers import AutoProcessor
 
+from boogu.utils.npu_utils import (
+    is_npu_device,
+    make_generator,
+    set_device_if_npu,
+)
+
 from boogu.models.transformers.transformer_boogu import (
     BooguImageTransformer2DModel,
     PromptEmbedding,
@@ -51,7 +57,6 @@ from boogu.utils.validator_utils import (
     get_device_validator,
     validate_device_and_offload_strategy_compatibility,
 )
-from boogu.utils.npu_utils import is_npu_device, make_generator, set_device_if_npu
 
 
 def to_bool(s):
