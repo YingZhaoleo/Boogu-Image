@@ -33,3 +33,6 @@ This branch adapts Boogu-Image inference so the model can run on Ascend NPU whil
 
 - Updated `README.md` and `README_CN.md` to state that this branch supports Ascend NPU inference and to summarize the major NPU support changes.
 
+## Test env
+CANN 9.0.0+torch 2.9.0+torch_npu 2.9.0.post2
+**REMARK**: don't forget to update the device in your *.sh script when you run your code on NPU.
